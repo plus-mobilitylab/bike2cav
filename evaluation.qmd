@@ -1,0 +1,395 @@
+---
+title: "Evaluating network-based interaction zones with real-world trajectory data"
+format:
+  html:
+    self-contained: true
+editor: visual
+---
+
+In the scope of the Bike2CAV project we have developed a workflow that automatically detects spatial areas on a traffic intersection in which it is expected that interactions between bicycles and cars will be taking place. This detection is purely based on the layout of the intersection as originally planned, with dedicated lanes of movement in different directions and for different vehicles. In this notebook we evaluate how accurate these detected zones are when considering how people actually move through the intersection, which might not always align to the original plan. We base this evaluation on trajectory data gathered at the intersection.
+
+## Prepare
+
+Load required libraries.
+
+```{r}
+#| message: false
+
+library(sf)
+library(tidyverse)
+library(units)
+library(here)
+```
+
+Load utility functions.
+
+```{r}
+#| message: false
+
+source(here("utils.R"))
+```
+
+Fetch all required data. They are stored in a single zip file. Some of the input datasets are already pre-processed. To get the zip file, please contact lucas.vandermeer@plus.ac.at.
+
+```{r}
+unzip(here("data", "data.zip"), overwrite = TRUE, exdir = here("data"))
+```
+
+Read trajectory data. These come in two datasets. The first one contains all observed sample points, with the time and location of the observation, and the id of the object being observed. The second one contains the lines that are drawn by chronologically connecting all the points belonging to the same object.
+
+```{r}
+src = "lidar" # Can be set to "lidar" or "cpm"
+
+all_points = read_sf(here("data", paste0("trajectory_points_", src, ".geojson")))
+all_lines = read_sf(here("data", paste0("trajectory_lines_", src, ".geojson")))
+```
+
+Read other data.
+
+```{r}
+lanes = read_sf(here("data", "lanes.geojson")) # Lanelets as polygons.
+zones = read_sf(here("data", "zones.geojson")) # Detected interaction zones.
+focus = read_sf(here("data", "focus.geojson")) # Focus area of the intersection.
+```
+
+## Pre-process
+
+### Transform data
+
+Transform all data into the same coordinate reference system.
+
+```{r}
+proj = 31287
+
+all_points = st_transform(all_points, proj)
+all_lines = st_transform(all_lines, proj)
+
+lanes = st_transform(lanes, proj)
+zones = st_transform(zones, proj)
+focus = st_transform(focus, proj)
+```
+
+### Tidy trajectory data
+
+Tidy up the trajectory data, by renaming columns and updating column types.
+
+```{r}
+all_points = all_points |>
+  st_zm()
+
+names(all_points) = gsub(":", "_", names(all_points))
+st_agr(all_points) = setNames(st_agr(all_points), setdiff(names(all_points), "geometry"))
+
+all_points$track_id = as.character(all_points$track_id)
+all_points$t = as.POSIXct(all_points$t / 1000, origin = "1970-01-01")
+```
+
+```{r}
+all_lines = all_lines |>
+  st_zm() |>
+  rename(t_start = startTimestamp, t_end = endTimestamp, t_update = updateTimestamp)
+
+names(all_lines) = gsub(":", "_", names(all_lines))
+st_agr(all_lines) = setNames(st_agr(all_lines), setdiff(names(all_lines), "geometry"))
+
+all_lines$t_start = as.POSIXct(all_lines$t_start / 1000, origin = "1970-01-01")
+all_lines$t_end = as.POSIXct(all_lines$t_end / 1000, origin = "1970-01-01")
+all_lines$t_update = as.POSIXct(all_lines$t_update / 1000, origin = "1970-01-01")
+```
+
+### Filter trajectories
+
+Calculate the length and displacement of each individual trajectory. The displacement is the straight-line distance from the start to the end of the trajectory.
+
+```{r}
+all_lines$length = st_length(all_lines)
+all_lines$displacement = st_displacement(all_lines)
+```
+
+Remove all trajectories with a displacement lower than 10 or higher than 70 meters.
+
+```{r}
+lower = set_units(10, "m")
+upper = set_units(70, "m")
+sub_lines = filter(all_lines, displacement > lower & displacement < upper)
+sub_points = filter(all_points, track_id %in% sub_lines$id)
+```
+
+Remove all trajectories that do not intersect with the focus area.
+
+```{r}
+sub_lines = st_filter(sub_lines, focus, .predicate = st_intersects)
+sub_points = filter(sub_points, track_id %in% sub_lines$id)
+```
+
+```{r}
+ggplot() + 
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
+  geom_sf(aes(geometry = st_geometry(all_lines)), color = "steelblue", alpha = 0.5) +
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
+  ggtitle("All trajectories")
+```
+
+```{r}
+ggplot() + 
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
+  geom_sf(aes(geometry = st_geometry(sub_lines)), color = "steelblue", alpha = 0.5) +
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
+  ggtitle("Filtered trajectories")
+```
+
+### Group trajectories by transport mode
+
+To define the transport mode of each trajectory, we make use of two attributes in the trajectory data: the detected *object type*, which makes a distinction between vehicles and pedestrians, and the detected *vehicle type*, which makes a distinction between different types of vehicles (e.g. car, bike) whenever the object type is vehicle.
+
+First, extract the last detected object and vehicle type of each trajectory.
+
+```{r}
+sub_lines = sub_lines |>
+  rename(object_type_last = object_type, vehicle_type_last = vehicle_type)
+
+last = sub_lines |>
+  st_drop_geometry() |>
+  select(id, object_type_last, vehicle_type_last)
+```
+
+Assign each individual trajectory point an object and vehicle type.
+
+```{r}
+sub_points = sub_points |>
+  rename(object_type = tag_changed_object_type, vehicle_type = tag_changed_vehicle_type)
+
+is_last = !duplicated(sub_points$track_id, fromLast = TRUE)
+
+last_types = sub_points |>
+  select(track_id) |>
+  left_join(last, by = c(track_id = "id"))
+
+sub_points$object_type[is_last] = last_types$object_type_last[is_last]
+sub_points$vehicle_type[is_last] = last_types$vehicle_type_last[is_last]
+
+sub_points = fill(sub_points, object_type, vehicle_type, .direction = "up")
+```
+
+Define the dominating object and vehicle type of each trajectory. This is the type that is most often assigned to a point within a trajectory. However, if less than 75% of the points in a trajectory have this type assigned, the dominating type is instead set to "unclear".
+
+```{r}
+dominator = function(x, threshold = 0.75) {
+  if (all(is.na(x))) return(NA)
+  tab = table(x)
+  mod = names(tab)[which(tab == max(tab))[1]]
+  if ((tab[mod] / sum(tab)) < threshold) {
+    out = "unclear"
+  } else {
+    out = mod
+  }
+  out
+}
+
+dominant = sub_points |>
+  st_drop_geometry() |>
+  group_by(track_id) |>
+  summarise(object_type_dominant = dominator(object_type), vehicle_type_dominant = dominator(vehicle_type))
+
+sub_lines = left_join(sub_lines, dominant, by = c(id = "track_id"))
+```
+
+Define the transport mode of each trajectory by mapping dominant object and vehicle types to a specific transport mode.
+
+```{r}
+sub_lines$mode = case_when(
+  sub_lines$object_type_dominant == "pedestrian" ~ "pedestrian",
+  sub_lines$object_type_dominant == "unclear" ~ "unclear",
+  sub_lines$vehicle_type_dominant == "passengerCar" ~ "car",
+  sub_lines$vehicle_type_dominant == "bike" ~ "bike",
+  sub_lines$vehicle_type_dominant == "motorcycle" ~ "motorcycle",
+  sub_lines$vehicle_type_dominant == "bus" ~ "bus",
+  sub_lines$vehicle_type_dominant == "heavyTruck" ~ "truck",
+  sub_lines$vehicle_type_dominant == "unclear" ~ "unclear",
+  TRUE ~ "unknown"
+)
+
+modes = sub_lines |>
+  st_drop_geometry() |>
+  select(id, mode)
+
+sub_points = left_join(sub_points, modes, by = c(track_id = "id"))
+```
+
+```{r}
+ggplot(modes |> group_by(mode) |> summarise(n = n())) + 
+  geom_bar(aes(x = n, y = mode), stat = "identity", fill = "steelblue") +
+  ggtitle("Number of trajectories per transport mode")
+```
+
+Group trajectories into car trajectories and bike trajectories.
+
+```{r}
+bike_points = filter(sub_points, mode == "bike")
+bike_lines = filter(sub_lines, mode == "bike")
+
+car_points = filter(sub_points, mode == "car")
+car_lines = filter(sub_lines, mode == "car")
+```
+
+```{r}
+ggplot() + 
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
+  geom_sf(aes(geometry = st_geometry(car_lines)), color = "steelblue", alpha = 0.5) + 
+  geom_sf(aes(geometry = st_geometry(bike_lines)), color = "violetred", alpha = 0.5) + 
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
+  ggtitle("Trajectories for cars (blue) and bikes (red)")
+```
+
+## Evaluate
+
+Map the network-based interaction zones to be evaluated. The darker grey area is the focus area of the intersections, in which we will conduct our analysis.
+
+```{r}
+ggplot() + 
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
+  geom_sf(aes(geometry = st_geometry(focus)), fill = "black", color = NA, alpha = 0.3) +
+  geom_sf(aes(geometry = st_geometry(zones)), fill = "steelblue", alpha = 0.8) +
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank(), legend.position = "none") +
+  ggtitle("Network-based interaction zones")
+```
+
+Define observed bike-car interactions in the trajectory data. To do so, we use the concept of [space-time prisms](https://link.springer.com/referenceworkentry/10.1007/978-3-319-17885-1_1599). For each individual bike trajectory point, we find those car trajectory points that are close in space (within 2 meters), and those car trajectory points that are close in time (within 2 seconds). A bike trajectory point becomes an interaction point if the *same* car trajectory point occurs in both the set of spatial neighbours and the set of temporal neighbours. We spatially filter the detected interaction points to keep only those inside our focus area.
+
+```{r}
+spatial_neighbours = function(x, y = x, threshold = 2) {
+  st_contains(st_buffer(x, threshold), y)
+}
+
+temporal_neighbours = function(x, y = x, threshold = 2, time_column = "time") {
+  xtime = x[[time_column]]
+  ytime = y[[time_column]]
+  lapply(xtime, \(x) which(ytime > (x - threshold) & ytime < (x + threshold)))
+}
+
+sn = spatial_neighbours(bike_points, car_points)
+tn = temporal_neighbours(bike_points, car_points, time_column = "t")
+
+bike_points$interaction = mapply(\(x, y) any(x %in% y), sn, tn)
+```
+
+```{r}
+interactions = bike_points |>
+  filter(interaction) |>
+  st_filter(focus)
+```
+
+```{r}
+ggplot() +
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
+  geom_sf(aes(geometry = st_geometry(focus)), fill = "black", color = NA, alpha = 0.3) +
+  geom_sf(aes(geometry = st_geometry(interactions)), color = "steelblue", alpha = 0.8) +
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
+  ggtitle("Trajectory-based interaction points")
+```
+Compare the number of trajectory-based interaction points that are located inside a network-based interaction zone to those that are located outside of a network-based interaction zone.
+
+We see here that the majority of trajectory-based interaction points are located outside of any network-based interaction zone.
+
+```{r}
+interactions = st_join(interactions, select(zones, id)) |>
+  rename(zone_id = id)
+
+interactions$location = case_when(is.na(interactions$zone_id) ~ "out", TRUE ~ "in")
+```
+
+```{r}
+ggplot() + 
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
+  geom_sf(aes(geometry = st_geometry(focus)), fill = "black", color = NA, alpha = 0.3) +
+  geom_sf(aes(geometry = st_geometry(zones)), fill = "steelblue", alpha = 0.8) +
+  geom_sf(aes(geometry = st_geometry(interactions)), alpha = 0.8) +
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank(), legend.position = "none") +
+  ggtitle("Network-based interaction zones and trajectory-based interaction points")
+```
+
+```{r}
+counts = interactions |>
+  st_drop_geometry() |>
+  group_by(location) |>
+  summarise(count = n()) |>
+  mutate(percentage = count / nrow(interactions) * 100)
+
+counts
+```
+
+```{r}
+ggplot(counts) + 
+  geom_bar(aes(x = count, y = location), fill = "steelblue", stat = "identity") +
+  ggtitle("Number of interaction points inside and outside of interaction zones")
+```
+Create a gridded representation of the focus area with 1x1 meter cells, calculate the interaction point density in each cell, and assign each grid cell an interaction zone. Then, compare the density of trajectory-based interaction points inside the network-based interaction zones to the density of trajectory-based interaction points outside of the network-based interaction zones. We see here that the density inside the zones is higher (note that the area outside of zones is much larger), but that many cells with high interaction point densities are located outside of any interaction zone.
+
+```{r}
+#| warning: false
+
+gridcells = st_make_grid(focus, cellsize = c(1, 1)) |>
+  st_as_sf() |>
+  mutate(gid = row_number())
+
+gridpoints = gridcells |>
+  mutate(density = lengths(st_intersects(gridcells, interactions))) |>
+  st_centroid() |>
+  st_filter(focus) |>
+  st_join(select(zones, id)) |>
+  rename(zone_id = id) |>
+  mutate(location = case_when(is.na(zone_id) ~ "out", TRUE ~ "in"))
+
+gridcells = inner_join(gridcells, st_drop_geometry(gridpoints), by = "gid")
+```
+
+```{r}
+ggplot() + 
+  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") +
+  geom_sf(aes(geometry = st_geometry(gridcells), fill = gridcells$density), alpha = 0.8) +
+  geom_sf(aes(geometry = st_geometry(zones)), fill = NA, color = "white") +
+  labs(fill = "density") +
+  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank(), legend.position = c(0.9, 0.7), legend.title = element_text(size = 8), legend.text = element_text(size = 6), legend.background = element_rect(fill = NA)) +
+  ggtitle("Gridded interaction point density overlayed with interaction zone borders")
+```
+```{r}
+areas = gridcells |>
+  st_drop_geometry() |>
+  group_by(location) |>
+  summarise(size = n())
+
+densities = gridcells |>
+  st_drop_geometry() |>
+  group_by(location) |>
+  summarise(density = mean(density))
+```
+
+```{r}
+ggplot(areas) + 
+  geom_bar(aes(x = size, y = location), fill = "steelblue", stat = "identity") +
+  ggtitle("Total area (m2) located inside and outside of interaction zones")
+```
+
+```{r}
+ggplot(densities) + 
+  geom_bar(aes(x = density, y = location), fill = "steelblue", stat = "identity") +
+  ggtitle("Density of interaction points inside and outside of interaction zones")
+```
+
+```{r}
+ggplot(filter(gridpoints, density > 0)) +
+  geom_boxplot(aes(x = density, y = location), fill = "steelblue") +
+  ggtitle("Distribution of interaction point densities inside and outside of interaction zones", subtitle = "Considering 1x1 meter grid cells containing at least one interaction point")
+```
+
+*TODO: Add a second approach that uses post-enchroachment times of crossing points between bike and car trajectories.
+
+## Discussion and conclusion
+
+By far most trajectory-based interaction points are found outside of the network-based interaction zones. Many spatial areas with a high density of trajectory-based interaction points are not located inside any network-based interaction zone. This implies that the detected interaction zones do not accurately reflect the real-world situation. An explanation for this could be that especially cyclists do in many cases not behave according to what the traffic planners had in mind when designing the intersection.
+
+It should be noted that the analyzed intersection has traffic lights, which minimize the possibility for bike-car interactions in many directions. These traffic lights where *not* taken into account in the detection of the interaction zones (this was based solely on the HD map of the intersection). It would be interesting to analyze an uncontrolled intersection, i.e. without traffic lights, instead.
+
+Secondly, it should be noted that many of the inferred interaction points are part of bike trajectories that move into a tunnel where bikes normally would not go. It is not clear if these trajectories are real bike trajectories, or that they are misclassified.
+
+To obtain more accurate interaction zones, a solution could be to run micro-simulation models that simulate movements of bikes and cars, trained with in-situ collected trajectory data. However, transferring calibrated model parameters to other intersections should be handled with care, as shown by [previous research](https://www.sciencedirect.com/science/article/abs/pii/S0001457515300385). Furthermore, it should be critically evaluated if all interactions are by definition bad and should always be avoided. A forced separation between traffic modes to minimize interactions may lead to a public space design that negatively affects well-being of the people making use of it.
