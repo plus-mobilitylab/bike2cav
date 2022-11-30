@@ -30,16 +30,14 @@ st_bearing = function(x) {
 }
 
 st_crossings = function(x, y) {
-  xgeom = st_geometry(x)
-  ygeom = st_geometry(y)
-  crosses = st_crosses(xgeom, ygeom)
-  xcross = xgeom[lengths(crosses) > 0]
-  ycross = ygeom[unique(do.call("c", crosses))]
+  crosses = st_crosses(x, y)
+  xcross = x[lengths(crosses) > 0, ]
+  ycross = y[unique(do.call("c", crosses)), ]
   all_intersections = st_intersection(xcross, ycross)
-  point_intersections = all_intersections[st_is(all_intersections, "POINT")]
+  point_intersections = all_intersections[st_is(all_intersections, "POINT"), ]
   boundaries = c(st_linebounds(x), st_linebounds(y))
   is_boundary = lengths(st_equals(point_intersections, boundaries)) > 0
-  point_intersections[!is_boundary]
+  point_intersections[!is_boundary, ]
 }
 
 st_linepoints = function(x) {
@@ -50,7 +48,7 @@ st_linepoints = function(x) {
   new_pts
 }
 
-st_segments = function(x) {
+st_lines_to_segments = function(x) {
   pts = sfc_to_df(st_geometry(x))
   is_startpoint = !duplicated(pts[["linestring_id"]])
   is_endpoint = !duplicated(pts[["linestring_id"]], fromLast = TRUE)
@@ -65,4 +63,28 @@ st_segments = function(x) {
   segments$line_id = src_pts$linestring_id
   st_crs(segments) = st_crs(x)
   segments
+}
+
+st_points_to_segments = function(x, linestring_id = "linestring_id") {
+  pts = sfc_to_df(st_geometry(x))
+  pts$linestring_id = x[[linestring_id]]
+  is_startpoint = !duplicated(pts[["linestring_id"]])
+  is_endpoint = !duplicated(pts[["linestring_id"]], fromLast = TRUE)
+  src_pts = pts[!is_endpoint, ]
+  trg_pts = pts[!is_startpoint, ]
+  src_pts$segment_id = seq_len(nrow(src_pts))
+  trg_pts$segment_id = seq_len(nrow(trg_pts))
+  new_pts = rbind(src_pts, trg_pts)
+  new_pts = new_pts[order(new_pts$segment_id), ]
+  coords = new_pts[names(new_pts) %in% c("x", "y", "z", "m", "segment_id")]
+  segments = sf_linestring(coords, linestring_id = "segment_id")
+  segments[[linestring_id]] = src_pts$linestring_id
+  st_crs(segments) = st_crs(x)
+  segments
+}
+
+st_as_tibble = function(x) {
+  if (class(x)[1] != "sf") stop("x should be an sf object") 
+  class(x) = c("sf", "tbl_df", "tbl", "data.frame")
+  x
 }
