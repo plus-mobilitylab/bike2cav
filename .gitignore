@@ -1,6 +1,6 @@
 data/*
 !data/.gitkeep
-
+snippets
 .todo
 
 # History files
