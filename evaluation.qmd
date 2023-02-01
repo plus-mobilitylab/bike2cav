@@ -17,6 +17,9 @@ Load required libraries.
 
 library(sf)
 library(tidyverse)
+library(spatstat)
+library(stars)
+library(viridis)
 library(units)
 library(here)
 ```
@@ -29,7 +32,7 @@ Load utility functions.
 source(here("utils.R"))
 ```
 
-Fetch all required data. They are stored in a single zip file. Some of the input datasets are already pre-processed. To get the zip file, please contact lucas.vandermeer@plus.ac.at.
+Fetch all required data. They are stored in a single zip file. Some of the input datasets are already pre-processed. To get the zip file, please contact lucas.vandermeer\@plus.ac.at.
 
 ```{r}
 unzip(here("data", "data.zip"), overwrite = TRUE, exdir = here("data"))
@@ -44,10 +47,8 @@ zones = read_sf(here("data", "zones.geojson"))
 Read trajectory data. These come in two separate datasets. The first one contains all observed sample points, with the time and location of the observation, and the index of the object being observed. The second one contains the lines that are drawn by chronologically connecting all the points belonging to the same object.
 
 ```{r}
-src = "lidar" # Can be set to "lidar" or "cpm"
-
-all_points = read_sf(here("data", paste0("trajectory_points_", src, ".geojson")))
-all_lines = read_sf(here("data", paste0("trajectory_lines_", src, ".geojson")))
+all_points = read_sf(here("data", "trajectories.gpkg"), layer = "points")
+all_lines = read_sf(here("data", "trajectories.gpkg"), layer = "lines")
 ```
 
 Read other data. These include the polygonized lanelets of the intersection to be analyzed, and the focus area of that intersection, which we will limit our analysis to.
@@ -79,11 +80,9 @@ focus = st_transform(focus, proj)
 Tidy up the trajectory data, by renaming columns and updating column types.
 
 ```{r}
-all_points = all_points |>
-  st_zm()
-
 names(all_points) = gsub(":", "_", names(all_points))
-st_agr(all_points) = setNames(st_agr(all_points), setdiff(names(all_points), "geometry"))
+names(all_points) = gsub("[.]", "_", names(all_points))
+st_agr(all_points) = setNames(st_agr(all_points), setdiff(names(all_points), "geom"))
 
 all_points$track_id = as.character(all_points$track_id)
 all_points$t = as.POSIXct(all_points$t / 1000, origin = "1970-01-01")
@@ -91,11 +90,11 @@ all_points$t = as.POSIXct(all_points$t / 1000, origin = "1970-01-01")
 
 ```{r}
 all_lines = all_lines |>
-  st_zm() |>
   rename(t_start = startTimestamp, t_end = endTimestamp, t_update = updateTimestamp)
 
 names(all_lines) = gsub(":", "_", names(all_lines))
-st_agr(all_lines) = setNames(st_agr(all_lines), setdiff(names(all_lines), "geometry"))
+names(all_lines) = gsub("[.]", "_", names(all_lines))
+st_agr(all_lines) = setNames(st_agr(all_lines), setdiff(names(all_lines), "geom"))
 
 all_lines$t_start = as.POSIXct(all_lines$t_start / 1000, origin = "1970-01-01")
 all_lines$t_end = as.POSIXct(all_lines$t_end / 1000, origin = "1970-01-01")
@@ -263,37 +262,9 @@ ggplot() +
 
 Find locations where bike and car trajectories interacted inside the focus area of the intersection.
 
-#### Approach I: Spatial crossings
+#### Approach I: Post-encroachment times
 
-This is the simplest approach. It finds all locations where a bike trajectory crosses a car trajectory. This approach does not take into account the temporal dimension, i.e. it does not check if the two trajectories crossed each other within a certain timeframe.
-
-```{r}
-#| warning: false
-
-line_crossings = st_crossings(bike_lines, car_lines) |>
-  remove_rownames() |>
-  st_as_tibble() |>
-  select(id, id.1) |>
-  rename(track_id_bike = id, track_id_car = id.1)
-```
-
-```{r}
-crossing_interactions = line_crossings |>
-  st_filter(focus)
-```
-
-```{r}
-ggplot() +
-  geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") + 
-  geom_sf(aes(geometry = st_geometry(focus)), fill = "black", color = NA, alpha = 0.3) +
-  geom_sf(aes(geometry = st_geometry(crossing_interactions)), cex = 0.8, alpha = 0.8) +
-  theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
-  ggtitle("Trajectory-based interaction points", subtitle = "Approach I: Spatial crossings")
-```
-
-#### Approach II: Post-encroachment times
-
-This approach extends the first approach along the temporal dimension. It finds all locations where a segment of a bike trajectory crosses a segment of a car trajectory, and then calculated the post-encroachment time of that crossing. The post-encroachment time in this case is defined as the time between the moment that the cyclist leaves the trajectory of the car driver and the moment that the car driver reaches the trajectory of the cyclist. In that way, the post-encroachment indicates the extent to which they missed each other. See [here](https://www.youtube.com/watch?v=rSABRwcVvUU) for a visual explanation. To define an interaction, the approach uses a threshold of 2 seconds (i.e. a crossing of trajectories is considered an interaction if the post-encroachment time is 2 seconds or less).
+This approach finds all locations where a segment of a bike trajectory crosses a segment of a car trajectory, and then calculated the post-encroachment time of that crossing. The post-encroachment time in this case is defined as the time between the moment that the cyclist leaves the trajectory of the car driver and the moment that the car driver reaches the trajectory of the cyclist. In that way, the post-encroachment indicates the extent to which they missed each other. See [here](https://www.youtube.com/watch?v=rSABRwcVvUU) for a visual explanation. To define an interaction, the approach uses a threshold of 2 seconds (i.e. a crossing of trajectories is considered an interaction if the post-encroachment time is 2 seconds or less).
 
 ```{r}
 bike_segments = st_points_to_segments(bike_points, linestring_id = "track_id")
@@ -348,9 +319,10 @@ ggplot() +
   geom_sf(aes(geometry = st_geometry(focus)), fill = "black", color = NA, alpha = 0.3) +
   geom_sf(aes(geometry = st_geometry(pet_interactions)), cex = 0.8, alpha = 0.8) +
   theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
-  ggtitle("Trajectory-based interaction points", subtitle = "Approach II: Post-encroachment times")
+  ggtitle("Trajectory-based interaction points", subtitle = "Approach I: Post-encroachment times")
 ```
-#### Approach III: Space-time prisms
+
+#### Approach II: Space-time prisms
 
 This approach utilizes the concept of [space-time prisms](https://link.springer.com/referenceworkentry/10.1007/978-3-319-17885-1_1599). For each individual bike trajectory point, it finds those car trajectory points that are close in space (within 2 meters), and those car trajectory points that are close in time (within 2 seconds). A bike trajectory point becomes an interaction point if the same car trajectory point occurs in both the set of spatial neighbors and the set of temporal neighbors.
 
@@ -383,7 +355,7 @@ ggplot() +
   geom_sf(aes(geometry = st_geometry(focus)), fill = "black", color = NA, alpha = 0.3) +
   geom_sf(aes(geometry = st_geometry(prism_interactions)), cex = 0.8, alpha = 0.8) +
   theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank()) +
-  ggtitle("Trajectory-based interaction points", subtitle = "Approach III: Space-time prisms")
+  ggtitle("Trajectory-based interaction points", subtitle = "Approach II: Space-time prisms")
 ```
 
 ### Compare interaction points with interaction zones
@@ -391,7 +363,7 @@ ggplot() +
 First, choose an approach for the detection of interaction points within trajectory data.
 
 ```{r}
-approach = "crossing" # Can be set to "crossing", "pet" or "prism"
+approach = "pet" # Can be set to "pet" or "prism"
 interactions = get(paste0(approach, "_interactions"))
 ```
 
@@ -432,52 +404,44 @@ ggplot(counts) +
   ggtitle("Number of interaction points inside and outside of interaction zones")
 ```
 
-Create a gridded representation of the focus area with 1x1 meter cells, calculate the trajectory-based interaction point density in each cell, and assign each grid cell a network-based interaction zone. Then, compare the density of trajectory-based interaction points inside the network-based interaction zones to the density of trajectory-based interaction points outside of the network-based interaction zones.
-
-We see here that the density inside the zones is higher on average (note that the area outside of zones is much larger), but that many cells with high interaction point densities are located outside of any interaction zone.
+Using quadrat counts of interaction occurrences on a 10x10 regular grid covering the focus area, we can assess if the point pattern of interaction locations is completely spatially random. We see here that this hypothesis can be discarded (given the small p-value), i.e. the observed pattern is likely not created by a random process.
 
 ```{r}
 #| warning: false
 
-gridcells = st_make_grid(focus, cellsize = c(1, 1)) |>
-  st_as_sf() |>
-  mutate(gid = row_number())
+pattern = as.ppp(c(st_geometry(focus), st_geometry(interactions))) |>
+  rjitter()
 
-gridpoints = gridcells |>
-  mutate(density = lengths(st_intersects(gridcells, interactions))) |>
-  st_centroid() |>
-  st_filter(focus) |>
-  st_join(select(zones, id)) |>
-  rename(zone_id = id) |>
-  mutate(location = case_when(is.na(zone_id) ~ "out", TRUE ~ "in"))
+quadrat.test(pattern, nx = 10, ny = 10)
+```
 
-gridcells = inner_join(gridcells, st_drop_geometry(gridpoints), by = "gid")
+Using basic kernel density estimation, we can get a better idea of where high density clusters of trajectory-based interaction points are located, and compare that to the network-based interaction zones. We see here that many high-density clusters are located outside of the network-based zones, and only few inside of them.
+
+```{r}
+density = density(pattern, sigma = 1.5) |>
+  st_as_stars() |>
+  st_as_sf(as_points = FALSE) |>
+  rename(density = v)
 ```
 
 ```{r}
 ggplot() + 
   geom_sf(aes(geometry = st_geometry(lanes)), fill = "grey90", color = "grey85") +
-  geom_sf(aes(geometry = st_geometry(gridcells), fill = gridcells$density), alpha = 0.8) +
+  geom_sf(aes(geometry = st_geometry(density), fill = density$density), lwd = 0.1) +
   geom_sf(aes(geometry = st_geometry(zones)), fill = NA, color = "white") +
   labs(fill = "density") +
+  scale_fill_viridis(option = "plasma") +
   theme(axis.ticks = element_blank(), axis.text = element_blank(), panel.background = element_blank(), legend.position = c(0.9, 0.7), legend.title = element_text(size = 8), legend.text = element_text(size = 6), legend.background = element_rect(fill = NA)) +
   ggtitle("Gridded interaction point density overlayed with interaction zone borders")
 ```
 
-```{r}
-ggplot(gridpoints) +
-  geom_boxplot(aes(x = density, y = location), fill = "steelblue") +
-  ggtitle("Interaction point densities inside and outside of interaction zones")
-```
-
 ## Discussion and conclusion
 
-By far most trajectory-based interaction points are found outside of the network-based interaction zones. Many spatial areas with a high density of trajectory-based interaction points are not located inside any network-based interaction zone. This implies that the detected interaction zones do not accurately reflect the real-world situation. An explanation for this could be that especially cyclists do in many cases not behave according to what the traffic planners had in mind when designing the intersection.
+By far most trajectory-based interaction points are found outside of the network-based interaction zones. Many areas with a high density of trajectory-based interaction points are not located inside any network-based interaction zone. This implies that the detected interaction zones do not accurately reflect the real-world situation. The network-based interaction zones expect users of specific modes to follow specific lanes, and interact only in small areas where these lanes cross. The trajectory-based interaction points however show a pattern in which many high-density clusters follow the shape of certain lanes, meaning that there is more mixed-used of lanes than we would expect from the network design. An explanation for this could be that especially cyclists do in many cases not behave according to what the traffic planners had in mind when designing the intersection.
 
 A few notes need to me made:
 
-- The trajectories are collected within a time span of only one hour, and therefore may not be representative enough to truly reflect the movement on the intersection.
-- The analyzed intersection has traffic lights, which minimize the possibility for bike-car interactions in many directions. These traffic lights where *not* taken into account in the detection of the interaction zones (this was based solely on the HD map of the intersection). It would be interesting to analyze an uncontrolled intersection, i.e. without traffic lights, instead.
-- Many of the inferred interaction points are part of bike trajectories that move into a tunnel where bikes normally would not go. It is not clear if these trajectories are real bike trajectories, or that they are misclassified.
+-   The analyzed intersection has traffic lights, which minimize the possibility for bike-car interactions in many directions. These traffic lights where *not* taken into account in the detection of the interaction zones (this was based solely on the HD map of the intersection). It would be interesting to analyze an uncontrolled intersection, i.e. without traffic lights, instead.
+-   Many of the inferred interaction points are part of bike trajectories that move into a tunnel where bikes normally would not go. It is not clear if these trajectories are real bike trajectories, or that they are misclassified.
 
 To obtain more accurate interaction zones, a solution could be to run micro-simulation models that simulate movements of bikes and cars, trained with collected trajectory data. However, transferring calibrated model parameters to other intersections should be handled with care, as shown by [previous research](https://www.sciencedirect.com/science/article/abs/pii/S0001457515300385). Furthermore, it should be critically evaluated if all interactions are by definition bad and should always be avoided. A forced separation between traffic modes to minimize interactions may lead to a public space design that negatively affects well-being of the people making use of it.
